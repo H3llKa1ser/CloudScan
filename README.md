@@ -19,3 +19,15 @@ Multi-Cloud Security Misconfiguration Scanner
 ### 4) Everything
 
     python cloudscan.py --provider all --mode both --targets targets.txt
+
+### 5) single inline target
+
+    python cloudscan.py --provider aws --mode unauth --target mybucket
+
+### 6) multiple inline
+
+    python cloudscan.py --provider gcp --mode unauth --target b1 --target b2
+
+### 7) inline + file combined (auto-deduplicated)
+
+    python cloudscan.py --provider aws --mode unauth --target extra --targets list.txt
