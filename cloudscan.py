@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """
-CloudScan - Multi-Cloud Security Misconfiguration Scanner
-==========================================================
+CloudScan - Multi-Cloud Security Misconfiguration Scanner (v2)
+==============================================================
 Supports: AWS, Azure, Microsoft 365, GCP
 Modes:    Authenticated (SDK/API) and Unauthenticated (external probing)
 
+New in v2:
+  * Inline --target flag (repeatable) in addition to --targets file
+  * CIS Benchmark control mappings on every finding
+  * --discover: derive likely bucket/storage/tenant names from a domain
+                so a single domain can feed ALL unauthenticated modules
+
 DISCLAIMER:
     Use ONLY against cloud accounts/resources you own or are explicitly
-    authorized to test. Unauthorized scanning may violate laws and the
-    provider's Acceptable Use Policy.
+    authorized to test. Unauthorized scanning may violate laws (e.g. CFAA)
+    and the provider's Acceptable Use Policy.
 
 Dependencies (install only what you need):
     pip install boto3 azure-identity azure-mgmt-storage azure-mgmt-network \
@@ -16,12 +22,22 @@ Dependencies (install only what you need):
                 google-api-python-client requests rich
 
 Usage:
+    # Authenticated
     python cloudscan.py --provider aws --mode auth
-    python cloudscan.py --provider aws --mode unauth --targets buckets.txt
-    python cloudscan.py --provider azure --mode auth
-    python cloudscan.py --provider m365 --mode auth
-    python cloudscan.py --provider gcp --mode auth
     python cloudscan.py --provider all --mode auth --output report.json
+
+    # Unauthenticated - inline targets (buckets / storage accounts / domains)
+    python cloudscan.py --provider aws   --mode unauth --target mycompany-backups
+    python cloudscan.py --provider m365  --mode unauth --target example.com
+
+    # Unauthenticated - target file
+    python cloudscan.py --provider gcp --mode unauth --targets buckets.txt
+
+    # Auto-discovery: derive likely resource names from one domain and probe
+    python cloudscan.py --provider all --mode unauth --discover example.com
+
+    # Both modes
+    python cloudscan.py --provider aws --mode both --target mybucket
 """
 
 import argparse
@@ -66,6 +82,7 @@ class Finding:
     description: str
     remediation: str
     mode: str  # auth | unauth
+    cis: str = "N/A"          # CIS Benchmark control reference
     metadata: dict = field(default_factory=dict)
 
 
@@ -87,6 +104,71 @@ class ScanReport:
 
 
 # ----------------------------------------------------------------------------
+# CIS Benchmark mapping table
+#   Centralized so check IDs map cleanly to published CIS controls.
+#   (References approximate published CIS Foundations Benchmark sections.)
+# ----------------------------------------------------------------------------
+CIS_MAP = {
+    # AWS  (CIS AWS Foundations Benchmark v3.0.0)
+    "AWS-S3-001": "CIS AWS 2.1.5 - S3 Block Public Access (account/bucket)",
+    "AWS-S3-002": "CIS AWS 2.1.5 - S3 Block Public Access",
+    "AWS-S3-003": "CIS AWS 2.1.1 - S3 default encryption (SSE)",
+    "AWS-S3-004": "CIS AWS 2.1.5 - No public S3 ACLs",
+    "AWS-SG-001": "CIS AWS 5.2/5.3 - No 0.0.0.0/0 to admin/db ports",
+    "AWS-IAM-001": "CIS AWS 1.8 - IAM password min length >= 14",
+    "AWS-IAM-002": "CIS AWS 1.8/1.9 - Password complexity/reuse",
+    "AWS-IAM-003": "CIS AWS 1.8 - Maintain IAM password policy",
+    "AWS-IAM-004": "CIS AWS 1.5 - MFA enabled for root account",
+    "AWS-CT-001": "CIS AWS 3.1 - CloudTrail enabled all regions",
+    "AWS-CT-002": "CIS AWS 3.1 - CloudTrail logging active",
+    "AWS-RDS-001": "CIS AWS 2.3.3 - RDS not publicly accessible",
+    "AWS-RDS-002": "CIS AWS 2.3.1 - RDS encryption at rest",
+    "AWS-EBS-001": "CIS AWS 2.2.1 - EBS encryption by default",
+    "AWS-S3-U01": "CIS AWS 2.1.5 - S3 Block Public Access (external)",
+    "AWS-S3-U02": "CIS AWS 2.1.5 - S3 bucket exposure (external)",
+    # Azure (CIS Microsoft Azure Foundations Benchmark v2.1.0)
+    "AZ-STG-001": "CIS Azure 3.7 - Disallow public blob access",
+    "AZ-STG-002": "CIS Azure 3.1 - Secure transfer required",
+    "AZ-STG-003": "CIS Azure 3.15 - Minimum TLS 1.2",
+    "AZ-STG-004": "CIS Azure 3.8 - Default network access = Deny",
+    "AZ-NSG-001": "CIS Azure 6.1/6.2 - No 0.0.0.0/0 to RDP/SSH/db",
+    "AZ-STG-U01": "CIS Azure 3.7 - Public blob exposure (external)",
+    "AZ-STG-U02": "CIS Azure 3.7 - Storage account exposure (external)",
+    # Microsoft 365 (CIS Microsoft 365 Foundations Benchmark v3.x)
+    "M365-001": "CIS M365 1.1.1 - Security Defaults / CA MFA enforced",
+    "M365-002": "CIS M365 1.1.6 - Restrict self-service sign-up",
+    "M365-003": "CIS M365 1.1.3 - Restrict app registration to admins",
+    "M365-004": "CIS M365 1.1.1 - MFA for privileged roles (PIM)",
+    "M365-005": "CIS M365 1.3.x - Restrict group creation",
+    "M365-U01": "CIS M365 1.x - Tenant exposure (external recon)",
+    "M365-U02": "CIS M365 1.x - Federation/IdP review (external recon)",
+    # GCP (CIS Google Cloud Platform Foundation Benchmark v2.0.0)
+    "GCP-GCS-001": "CIS GCP 5.1 - Buckets not anonymously/public accessible",
+    "GCP-GCS-002": "CIS GCP 5.2 - Uniform bucket-level access enabled",
+    "GCP-FW-001": "CIS GCP 3.6/3.7 - No 0.0.0.0/0 to all/admin ports",
+    "GCP-FW-002": "CIS GCP 3.6/3.7 - No 0.0.0.0/0 to RDP/SSH/db",
+    "GCP-IAM-001": "CIS GCP 1.4 - Rotate/avoid user-managed SA keys",
+    "GCP-GCS-U01": "CIS GCP 5.1 - Public bucket exposure (external)",
+    "GCP-GCS-U02": "CIS GCP 5.1 - Bucket exposure (external)",
+}
+
+
+def cis_for(check_id: str) -> str:
+    return CIS_MAP.get(check_id, "N/A")
+
+
+# ----------------------------------------------------------------------------
+# Logging helper
+# ----------------------------------------------------------------------------
+def log(msg, level="info"):
+    colors = {"info": "cyan", "warn": "yellow", "err": "red", "ok": "green"}
+    if RICH:
+        console.print(f"[{colors.get(level,'white')}]{msg}[/]")
+    else:
+        print(msg)
+
+
+# ----------------------------------------------------------------------------
 # Base scanner interface
 # ----------------------------------------------------------------------------
 class BaseScanner:
@@ -101,6 +183,11 @@ class BaseScanner:
     def scan_unauthenticated(self, targets: List[str]):
         raise NotImplementedError
 
+    def add_finding(self, **kwargs):
+        """Wrapper that auto-injects the CIS mapping for a check_id."""
+        kwargs.setdefault("cis", cis_for(kwargs.get("check_id", "")))
+        self.report.add(Finding(**kwargs))
+
     def _safe(self, fn, *args, **kwargs):
         """Run a check, never let one failure kill the whole scan."""
         try:
@@ -111,12 +198,81 @@ class BaseScanner:
             return None
 
 
-def log(msg, level="info"):
-    colors = {"info": "cyan", "warn": "yellow", "err": "red", "ok": "green"}
-    if RICH:
-        console.print(f"[{colors.get(level,'white')}]{msg}[/]")
-    else:
-        print(msg)
+# ----------------------------------------------------------------------------
+# DNS-based auto-discovery
+#   Given a domain (e.g. example.com), generate likely resource names for
+#   each cloud and verify which actually exist via lightweight HTTP probes.
+# ----------------------------------------------------------------------------
+class Discovery:
+    """Derive candidate resource names from a domain and validate existence."""
+
+    # Common naming permutations seen in the wild.
+    SUFFIXES = [
+        "", "-prod", "-dev", "-staging", "-test", "-backup", "-backups",
+        "-data", "-assets", "-static", "-media", "-logs", "-public",
+        "-private", "-storage", "-files", "-uploads", "-images", "-cdn",
+        "-archive", "-db", "-config", "-secret", "-secrets", "-internal",
+    ]
+    PREFIXES = ["", "prod-", "dev-", "staging-", "backup-", "data-",
+                "assets-", "static-", "internal-"]
+
+    def __init__(self):
+        try:
+            import requests
+            self.requests = requests
+        except ImportError:
+            self.requests = None
+
+    @staticmethod
+    def _base_tokens(domain: str) -> List[str]:
+        """Extract usable base tokens from a domain.
+        example.com         -> ['example']
+        my-app.co.uk        -> ['my-app', 'myapp', 'my']
+        """
+        host = domain.strip().lower().split("://")[-1].split("/")[0]
+        labels = host.split(".")
+        # drop common public-suffix tail labels
+        tail = {"com", "net", "org", "io", "co", "uk", "us", "gov", "edu",
+                "cloud", "app", "dev", "ai"}
+        core = [l for l in labels if l not in tail] or labels
+        base = core[0]
+        tokens = {base, base.replace("-", ""), base.replace("-", "")}
+        if "-" in base:
+            tokens.add(base.split("-")[0])
+        # also include full second-level label set joined
+        tokens.add("".join(core))
+        return sorted({t for t in tokens if t})
+
+    def candidate_names(self, domain: str, limit: int = 200) -> List[str]:
+        """Generate candidate bucket/account names for AWS/GCP/Azure."""
+        names = set()
+        for base in self._base_tokens(domain):
+            for pre in self.PREFIXES:
+                for suf in self.SUFFIXES:
+                    name = f"{pre}{base}{suf}"
+                    if 3 <= len(name) <= 63:
+                        names.add(name)
+        out = sorted(names)
+        return out[:limit]
+
+    def azure_candidate_names(self, domain: str, limit: int = 200) -> List[str]:
+        """Azure storage account names: 3-24 chars, lowercase alnum only."""
+        names = set()
+        for base in self._base_tokens(domain):
+            b = "".join(ch for ch in base if ch.isalnum())
+            for suf in ["", "prod", "dev", "data", "backup", "store",
+                        "storage", "assets", "logs", "files", "media",
+                        "static", "archive"]:
+                name = f"{b}{suf}"
+                if 3 <= len(name) <= 24:
+                    names.add(name)
+        out = sorted(names)
+        return out[:limit]
+
+    def domains_for(self, domain: str) -> List[str]:
+        """M365 module just needs the domain itself."""
+        host = domain.strip().lower().split("://")[-1].split("/")[0]
+        return [host]
 
 
 # ============================================================================
@@ -158,50 +314,51 @@ class AWSScanner(BaseScanner):
         buckets = s3.list_buckets().get("Buckets", [])
         for b in buckets:
             name = b["Name"]
-            # Public access block
             try:
                 pab = s3.get_public_access_block(Bucket=name)
                 cfg = pab["PublicAccessBlockConfiguration"]
                 if not all(cfg.values()):
-                    self.report.add(Finding(
-                        "aws", "S3", name, "AWS-S3-001",
-                        "S3 bucket public access not fully blocked",
-                        Severity.HIGH,
-                        "One or more Block Public Access settings are disabled.",
-                        "Enable all four Block Public Access settings.",
-                        "auth", {"config": cfg}))
+                    self.add_finding(
+                        provider="aws", service="S3", resource=name,
+                        check_id="AWS-S3-001",
+                        title="S3 bucket public access not fully blocked",
+                        severity=Severity.HIGH,
+                        description="One or more Block Public Access settings are disabled.",
+                        remediation="Enable all four Block Public Access settings.",
+                        mode="auth", metadata={"config": cfg})
             except self.ClientError:
-                self.report.add(Finding(
-                    "aws", "S3", name, "AWS-S3-002",
-                    "S3 bucket missing Public Access Block",
-                    Severity.HIGH,
-                    "No Public Access Block configuration found.",
-                    "Apply a Public Access Block to the bucket.",
-                    "auth"))
-            # Encryption
+                self.add_finding(
+                    provider="aws", service="S3", resource=name,
+                    check_id="AWS-S3-002",
+                    title="S3 bucket missing Public Access Block",
+                    severity=Severity.HIGH,
+                    description="No Public Access Block configuration found.",
+                    remediation="Apply a Public Access Block to the bucket.",
+                    mode="auth")
             try:
                 s3.get_bucket_encryption(Bucket=name)
             except self.ClientError:
-                self.report.add(Finding(
-                    "aws", "S3", name, "AWS-S3-003",
-                    "S3 bucket has no default encryption",
-                    Severity.MEDIUM,
-                    "Server-side encryption is not configured.",
-                    "Enable SSE-S3 or SSE-KMS default encryption.",
-                    "auth"))
-            # ACL public grants
+                self.add_finding(
+                    provider="aws", service="S3", resource=name,
+                    check_id="AWS-S3-003",
+                    title="S3 bucket has no default encryption",
+                    severity=Severity.MEDIUM,
+                    description="Server-side encryption is not configured.",
+                    remediation="Enable SSE-S3 or SSE-KMS default encryption.",
+                    mode="auth")
             try:
                 acl = s3.get_bucket_acl(Bucket=name)
                 for g in acl.get("Grants", []):
                     uri = g.get("Grantee", {}).get("URI", "")
                     if "AllUsers" in uri or "AuthenticatedUsers" in uri:
-                        self.report.add(Finding(
-                            "aws", "S3", name, "AWS-S3-004",
-                            "S3 bucket ACL grants public access",
-                            Severity.CRITICAL,
-                            f"ACL grants access to {uri}",
-                            "Remove public ACL grants.",
-                            "auth"))
+                        self.add_finding(
+                            provider="aws", service="S3", resource=name,
+                            check_id="AWS-S3-004",
+                            title="S3 bucket ACL grants public access",
+                            severity=Severity.CRITICAL,
+                            description=f"ACL grants access to {uri}",
+                            remediation="Remove public ACL grants.",
+                            mode="auth")
             except self.ClientError:
                 pass
 
@@ -219,93 +376,122 @@ class AWSScanner(BaseScanner):
                         to = perm.get("ToPort", 65535)
                         for p, svc in risky_ports.items():
                             if frm <= p <= to:
-                                self.report.add(Finding(
-                                    "aws", "EC2/SG", sg["GroupId"],
-                                    "AWS-SG-001",
-                                    f"Security group exposes {svc} to internet",
-                                    Severity.CRITICAL,
-                                    f"Port {p} open to 0.0.0.0/0",
-                                    f"Restrict {svc} (port {p}) to known IPs.",
-                                    "auth", {"group_name": sg.get("GroupName")}))
+                                self.add_finding(
+                                    provider="aws", service="EC2/SG",
+                                    resource=sg["GroupId"],
+                                    check_id="AWS-SG-001",
+                                    title=f"Security group exposes {svc} to internet",
+                                    severity=Severity.CRITICAL,
+                                    description=f"Port {p} open to 0.0.0.0/0",
+                                    remediation=f"Restrict {svc} (port {p}) to known IPs.",
+                                    mode="auth",
+                                    metadata={"group_name": sg.get("GroupName")})
 
     def _check_iam_password_policy(self):
         iam = self.boto3.client("iam")
         try:
             pol = iam.get_account_password_policy()["PasswordPolicy"]
             if pol.get("MinimumPasswordLength", 0) < 14:
-                self.report.add(Finding(
-                    "aws", "IAM", "account", "AWS-IAM-001",
-                    "Weak IAM password length policy", Severity.MEDIUM,
-                    f"Minimum length is {pol.get('MinimumPasswordLength')}.",
-                    "Set minimum password length to >= 14.", "auth"))
+                self.add_finding(
+                    provider="aws", service="IAM", resource="account",
+                    check_id="AWS-IAM-001",
+                    title="Weak IAM password length policy",
+                    severity=Severity.MEDIUM,
+                    description=f"Minimum length is {pol.get('MinimumPasswordLength')}.",
+                    remediation="Set minimum password length to >= 14.",
+                    mode="auth")
             if not pol.get("RequireSymbols") or not pol.get("RequireNumbers"):
-                self.report.add(Finding(
-                    "aws", "IAM", "account", "AWS-IAM-002",
-                    "IAM password complexity weak", Severity.LOW,
-                    "Symbols or numbers not required.",
-                    "Require symbols, numbers, upper & lowercase.", "auth"))
+                self.add_finding(
+                    provider="aws", service="IAM", resource="account",
+                    check_id="AWS-IAM-002",
+                    title="IAM password complexity weak",
+                    severity=Severity.LOW,
+                    description="Symbols or numbers not required.",
+                    remediation="Require symbols, numbers, upper & lowercase.",
+                    mode="auth")
         except self.ClientError:
-            self.report.add(Finding(
-                "aws", "IAM", "account", "AWS-IAM-003",
-                "No IAM account password policy", Severity.HIGH,
-                "No password policy configured.",
-                "Configure a strong account password policy.", "auth"))
+            self.add_finding(
+                provider="aws", service="IAM", resource="account",
+                check_id="AWS-IAM-003",
+                title="No IAM account password policy",
+                severity=Severity.HIGH,
+                description="No password policy configured.",
+                remediation="Configure a strong account password policy.",
+                mode="auth")
 
     def _check_iam_mfa_root(self):
         iam = self.boto3.client("iam")
         summary = iam.get_account_summary()["SummaryMap"]
         if summary.get("AccountMFAEnabled", 0) == 0:
-            self.report.add(Finding(
-                "aws", "IAM", "root", "AWS-IAM-004",
-                "Root account MFA disabled", Severity.CRITICAL,
-                "MFA is not enabled on the root account.",
-                "Enable hardware/virtual MFA on root.", "auth"))
+            self.add_finding(
+                provider="aws", service="IAM", resource="root",
+                check_id="AWS-IAM-004",
+                title="Root account MFA disabled",
+                severity=Severity.CRITICAL,
+                description="MFA is not enabled on the root account.",
+                remediation="Enable hardware/virtual MFA on root.",
+                mode="auth")
 
     def _check_cloudtrail(self):
         ct = self.boto3.client("cloudtrail")
         trails = ct.describe_trails().get("trailList", [])
         if not trails:
-            self.report.add(Finding(
-                "aws", "CloudTrail", "account", "AWS-CT-001",
-                "No CloudTrail trails configured", Severity.HIGH,
-                "API activity is not being logged.",
-                "Create a multi-region CloudTrail trail.", "auth"))
+            self.add_finding(
+                provider="aws", service="CloudTrail", resource="account",
+                check_id="AWS-CT-001",
+                title="No CloudTrail trails configured",
+                severity=Severity.HIGH,
+                description="API activity is not being logged.",
+                remediation="Create a multi-region CloudTrail trail.",
+                mode="auth")
         for t in trails:
             status = ct.get_trail_status(Name=t["TrailARN"])
             if not status.get("IsLogging"):
-                self.report.add(Finding(
-                    "aws", "CloudTrail", t["Name"], "AWS-CT-002",
-                    "CloudTrail logging disabled", Severity.HIGH,
-                    "Trail exists but is not logging.",
-                    "Start logging on the trail.", "auth"))
+                self.add_finding(
+                    provider="aws", service="CloudTrail", resource=t["Name"],
+                    check_id="AWS-CT-002",
+                    title="CloudTrail logging disabled",
+                    severity=Severity.HIGH,
+                    description="Trail exists but is not logging.",
+                    remediation="Start logging on the trail.",
+                    mode="auth")
 
     def _check_rds_public(self):
         rds = self.boto3.client("rds")
         for db in rds.describe_db_instances().get("DBInstances", []):
             if db.get("PubliclyAccessible"):
-                self.report.add(Finding(
-                    "aws", "RDS", db["DBInstanceIdentifier"], "AWS-RDS-001",
-                    "RDS instance is publicly accessible", Severity.HIGH,
-                    "Database is reachable from the internet.",
-                    "Disable public accessibility; use private subnets.",
-                    "auth"))
+                self.add_finding(
+                    provider="aws", service="RDS",
+                    resource=db["DBInstanceIdentifier"],
+                    check_id="AWS-RDS-001",
+                    title="RDS instance is publicly accessible",
+                    severity=Severity.HIGH,
+                    description="Database is reachable from the internet.",
+                    remediation="Disable public accessibility; use private subnets.",
+                    mode="auth")
             if not db.get("StorageEncrypted"):
-                self.report.add(Finding(
-                    "aws", "RDS", db["DBInstanceIdentifier"], "AWS-RDS-002",
-                    "RDS storage not encrypted", Severity.MEDIUM,
-                    "Storage encryption at rest is disabled.",
-                    "Enable storage encryption (requires snapshot/restore).",
-                    "auth"))
+                self.add_finding(
+                    provider="aws", service="RDS",
+                    resource=db["DBInstanceIdentifier"],
+                    check_id="AWS-RDS-002",
+                    title="RDS storage not encrypted",
+                    severity=Severity.MEDIUM,
+                    description="Storage encryption at rest is disabled.",
+                    remediation="Enable storage encryption (snapshot/restore).",
+                    mode="auth")
 
     def _check_ebs_encryption(self):
         ec2 = self.boto3.client("ec2")
         res = ec2.get_ebs_encryption_by_default()
         if not res.get("EbsEncryptionByDefault"):
-            self.report.add(Finding(
-                "aws", "EC2/EBS", "account", "AWS-EBS-001",
-                "EBS default encryption disabled", Severity.MEDIUM,
-                "New EBS volumes are not encrypted by default.",
-                "Enable EBS encryption by default in EC2 settings.", "auth"))
+            self.add_finding(
+                provider="aws", service="EC2/EBS", resource="account",
+                check_id="AWS-EBS-001",
+                title="EBS default encryption disabled",
+                severity=Severity.MEDIUM,
+                description="New EBS volumes are not encrypted by default.",
+                remediation="Enable EBS encryption by default in EC2 settings.",
+                mode="auth")
 
     # ---- unauthenticated ----
     def scan_unauthenticated(self, targets):
@@ -324,24 +510,28 @@ class AWSScanner(BaseScanner):
                     continue
                 if r.status_code == 200 and ("<ListBucketResult" in r.text
                                              or "<Contents>" in r.text):
-                    self.report.add(Finding(
-                        "aws", "S3", bucket, "AWS-S3-U01",
-                        "Public S3 bucket listing exposed", Severity.CRITICAL,
-                        f"Bucket contents are publicly listable at {url}",
-                        "Enable Block Public Access; remove public ACLs.",
-                        "unauth", {"url": url}))
+                    self.add_finding(
+                        provider="aws", service="S3", resource=bucket,
+                        check_id="AWS-S3-U01",
+                        title="Public S3 bucket listing exposed",
+                        severity=Severity.CRITICAL,
+                        description=f"Bucket contents are publicly listable at {url}",
+                        remediation="Enable Block Public Access; remove public ACLs.",
+                        mode="unauth", metadata={"url": url})
                     return
                 elif r.status_code == 403:
-                    self.report.add(Finding(
-                        "aws", "S3", bucket, "AWS-S3-U02",
-                        "S3 bucket exists (access denied)", Severity.INFO,
-                        f"Bucket exists but listing denied at {url}",
-                        "Verify intended access; bucket name enumerable.",
-                        "unauth", {"url": url}))
+                    self.add_finding(
+                        provider="aws", service="S3", resource=bucket,
+                        check_id="AWS-S3-U02",
+                        title="S3 bucket exists (access denied)",
+                        severity=Severity.INFO,
+                        description=f"Bucket exists but listing denied at {url}",
+                        remediation="Verify intended access; name is enumerable.",
+                        mode="unauth", metadata={"url": url})
                     return
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
-            ex.map(probe, [t.strip() for t in targets if t.strip()])
+            list(ex.map(probe, [t.strip() for t in targets if t.strip()]))
 
 
 # ============================================================================
@@ -369,6 +559,8 @@ class AzureScanner(BaseScanner):
             log(f"[Azure] Auth failed: {e}", "err")
             return
 
+        from azure.mgmt.storage import StorageManagementClient
+        from azure.mgmt.network import NetworkManagementClient
         for sub in subs:
             sub_id = sub.subscription_id
             log(f"[Azure] Scanning subscription {sub_id}", "ok")
@@ -380,33 +572,43 @@ class AzureScanner(BaseScanner):
     def _check_storage_accounts(self, sc):
         for acct in sc.storage_accounts.list():
             if acct.allow_blob_public_access:
-                self.report.add(Finding(
-                    "azure", "Storage", acct.name, "AZ-STG-001",
-                    "Storage account allows public blob access",
-                    Severity.HIGH,
-                    "allowBlobPublicAccess is enabled.",
-                    "Set allowBlobPublicAccess = false.", "auth"))
+                self.add_finding(
+                    provider="azure", service="Storage", resource=acct.name,
+                    check_id="AZ-STG-001",
+                    title="Storage account allows public blob access",
+                    severity=Severity.HIGH,
+                    description="allowBlobPublicAccess is enabled.",
+                    remediation="Set allowBlobPublicAccess = false.",
+                    mode="auth")
             if not acct.enable_https_traffic_only:
-                self.report.add(Finding(
-                    "azure", "Storage", acct.name, "AZ-STG-002",
-                    "Storage account allows HTTP traffic", Severity.MEDIUM,
-                    "Secure transfer (HTTPS only) is disabled.",
-                    "Enable 'Secure transfer required'.", "auth"))
+                self.add_finding(
+                    provider="azure", service="Storage", resource=acct.name,
+                    check_id="AZ-STG-002",
+                    title="Storage account allows HTTP traffic",
+                    severity=Severity.MEDIUM,
+                    description="Secure transfer (HTTPS only) is disabled.",
+                    remediation="Enable 'Secure transfer required'.",
+                    mode="auth")
             mtls = getattr(acct, "minimum_tls_version", None)
             if mtls and mtls < "TLS1_2":
-                self.report.add(Finding(
-                    "azure", "Storage", acct.name, "AZ-STG-003",
-                    "Storage account weak minimum TLS", Severity.MEDIUM,
-                    f"Minimum TLS version is {mtls}.",
-                    "Set minimum TLS version to 1.2.", "auth"))
+                self.add_finding(
+                    provider="azure", service="Storage", resource=acct.name,
+                    check_id="AZ-STG-003",
+                    title="Storage account weak minimum TLS",
+                    severity=Severity.MEDIUM,
+                    description=f"Minimum TLS version is {mtls}.",
+                    remediation="Set minimum TLS version to 1.2.",
+                    mode="auth")
             net = getattr(acct, "network_rule_set", None)
             if net and net.default_action == "Allow":
-                self.report.add(Finding(
-                    "azure", "Storage", acct.name, "AZ-STG-004",
-                    "Storage account network default-allow", Severity.MEDIUM,
-                    "Firewall default action allows all networks.",
-                    "Set default network action to Deny and whitelist.",
-                    "auth"))
+                self.add_finding(
+                    provider="azure", service="Storage", resource=acct.name,
+                    check_id="AZ-STG-004",
+                    title="Storage account network default-allow",
+                    severity=Severity.MEDIUM,
+                    description="Firewall default action allows all networks.",
+                    remediation="Set default network action to Deny and whitelist.",
+                    mode="auth")
 
     def _check_nsgs(self, nc):
         risky = {22: "SSH", 3389: "RDP", 1433: "MSSQL", 3306: "MySQL",
@@ -423,12 +625,15 @@ class AzureScanner(BaseScanner):
                     for pr in ports:
                         hit = self._port_in_range(pr, risky)
                         if hit:
-                            self.report.add(Finding(
-                                "azure", "NSG", nsg.name, "AZ-NSG-001",
-                                f"NSG exposes {risky[hit]} to internet",
-                                Severity.CRITICAL,
-                                f"Rule '{rule.name}' allows {pr} from any source.",
-                                f"Restrict source for port {hit}.", "auth"))
+                            self.add_finding(
+                                provider="azure", service="NSG",
+                                resource=nsg.name,
+                                check_id="AZ-NSG-001",
+                                title=f"NSG exposes {risky[hit]} to internet",
+                                severity=Severity.CRITICAL,
+                                description=f"Rule '{rule.name}' allows {pr} from any source.",
+                                remediation=f"Restrict source for port {hit}.",
+                                mode="auth")
 
     @staticmethod
     def _port_in_range(pr, risky):
@@ -459,23 +664,26 @@ class AzureScanner(BaseScanner):
             except requests.RequestException:
                 return
             if r.status_code == 200 and "<EnumerationResults" in r.text:
-                self.report.add(Finding(
-                    "azure", "Storage", acct, "AZ-STG-U01",
-                    "Public Azure storage enumeration exposed",
-                    Severity.CRITICAL,
-                    f"Container listing exposed at {url}",
-                    "Disable anonymous access on the storage account.",
-                    "unauth", {"url": url}))
+                self.add_finding(
+                    provider="azure", service="Storage", resource=acct,
+                    check_id="AZ-STG-U01",
+                    title="Public Azure storage enumeration exposed",
+                    severity=Severity.CRITICAL,
+                    description=f"Container listing exposed at {url}",
+                    remediation="Disable anonymous access on the storage account.",
+                    mode="unauth", metadata={"url": url})
             elif r.status_code in (400, 403, 409):
-                self.report.add(Finding(
-                    "azure", "Storage", acct, "AZ-STG-U02",
-                    "Azure storage account exists", Severity.INFO,
-                    "Storage account name resolves (enumerable).",
-                    "Account name is discoverable; ensure no anon access.",
-                    "unauth", {"url": url}))
+                self.add_finding(
+                    provider="azure", service="Storage", resource=acct,
+                    check_id="AZ-STG-U02",
+                    title="Azure storage account exists",
+                    severity=Severity.INFO,
+                    description="Storage account name resolves (enumerable).",
+                    remediation="Account name discoverable; ensure no anon access.",
+                    mode="unauth", metadata={"url": url})
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
-            ex.map(probe, [t.strip() for t in targets if t.strip()])
+            list(ex.map(probe, [t.strip() for t in targets if t.strip()]))
 
 
 # ============================================================================
@@ -537,69 +745,79 @@ class M365Scanner(BaseScanner):
         data = self._graph(
             "/policies/identitySecurityDefaultsEnforcementPolicy")
         if data and data.get("isEnabled") is False:
-            # Not necessarily bad if CA policies exist, but flag for review
-            self.report.add(Finding(
-                "m365", "AAD", "tenant", "M365-001",
-                "Security Defaults disabled", Severity.MEDIUM,
-                "Security Defaults are off. Ensure Conditional Access covers MFA.",
-                "Enable Security Defaults or equivalent CA policies.", "auth"))
+            self.add_finding(
+                provider="m365", service="AAD", resource="tenant",
+                check_id="M365-001",
+                title="Security Defaults disabled",
+                severity=Severity.MEDIUM,
+                description="Security Defaults are off. Ensure Conditional Access enforces MFA.",
+                remediation="Enable Security Defaults or equivalent CA policies.",
+                mode="auth")
 
     def _check_legacy_auth_policies(self):
         data = self._graph("/policies/authorizationPolicy")
         if data:
             if data.get("allowedToSignUpEmailBasedSubscriptions"):
-                self.report.add(Finding(
-                    "m365", "AAD", "tenant", "M365-002",
-                    "Self-service sign-up enabled", Severity.LOW,
-                    "Users can sign up for email-based subscriptions.",
-                    "Disable if not required.", "auth"))
+                self.add_finding(
+                    provider="m365", service="AAD", resource="tenant",
+                    check_id="M365-002",
+                    title="Self-service sign-up enabled",
+                    severity=Severity.LOW,
+                    description="Users can sign up for email-based subscriptions.",
+                    remediation="Disable if not required.",
+                    mode="auth")
             if data.get("defaultUserRolePermissions", {}).get(
                     "allowedToCreateApps"):
-                self.report.add(Finding(
-                    "m365", "AAD", "tenant", "M365-003",
-                    "Users can register applications", Severity.MEDIUM,
-                    "All users can create app registrations.",
-                    "Restrict app registration to admins.", "auth"))
+                self.add_finding(
+                    provider="m365", service="AAD", resource="tenant",
+                    check_id="M365-003",
+                    title="Users can register applications",
+                    severity=Severity.MEDIUM,
+                    description="All users can create app registrations.",
+                    remediation="Restrict app registration to admins.",
+                    mode="auth")
 
     def _check_admin_mfa(self):
-        # Enumerate privileged role members for review
         roles = self._graph("/directoryRoles").get("value", [])
         for role in roles:
             if "admin" in (role.get("displayName") or "").lower():
                 members = self._graph(
                     f"/directoryRoles/{role['id']}/members").get("value", [])
                 if members:
-                    self.report.add(Finding(
-                        "m365", "AAD", role["displayName"], "M365-004",
-                        "Privileged role members present (verify MFA)",
-                        Severity.INFO,
-                        f"{len(members)} member(s) in '{role['displayName']}'. "
-                        "Confirm all enforce phishing-resistant MFA.",
-                        "Enforce MFA/PIM for all privileged roles.", "auth",
-                        {"member_count": len(members)}))
+                    self.add_finding(
+                        provider="m365", service="AAD",
+                        resource=role["displayName"],
+                        check_id="M365-004",
+                        title="Privileged role members present (verify MFA)",
+                        severity=Severity.INFO,
+                        description=(f"{len(members)} member(s) in "
+                                     f"'{role['displayName']}'. Confirm all "
+                                     "enforce phishing-resistant MFA."),
+                        remediation="Enforce MFA/PIM for all privileged roles.",
+                        mode="auth", metadata={"member_count": len(members)})
 
     def _check_user_consent(self):
-        data = self._graph(
-            "/policies/authorizationPolicy")
+        data = self._graph("/policies/authorizationPolicy")
         grant = data.get("defaultUserRolePermissions", {}) if data else {}
-        # Heuristic flag
         if grant.get("allowedToCreateSecurityGroups"):
-            self.report.add(Finding(
-                "m365", "AAD", "tenant", "M365-005",
-                "All users can create security groups", Severity.LOW,
-                "Group sprawl / access-control risk.",
-                "Restrict group creation where possible.", "auth"))
+            self.add_finding(
+                provider="m365", service="AAD", resource="tenant",
+                check_id="M365-005",
+                title="All users can create security groups",
+                severity=Severity.LOW,
+                description="Group sprawl / access-control risk.",
+                remediation="Restrict group creation where possible.",
+                mode="auth")
 
     def scan_unauthenticated(self, targets):
         """
         Unauthenticated M365 recon: tenant existence + domain federation info
-        via the public OpenID/realm endpoints. targets = list of domains.
+        via public OpenID/realm endpoints. targets = list of domains.
         """
         import requests
         log("[M365] Tenant/domain recon...", "info")
 
         def probe(domain):
-            # Tenant existence via OpenID configuration
             cfg_url = (f"https://login.microsoftonline.com/{domain}/"
                        ".well-known/openid-configuration")
             try:
@@ -607,29 +825,32 @@ class M365Scanner(BaseScanner):
             except requests.RequestException:
                 return
             if r.status_code == 200:
-                self.report.add(Finding(
-                    "m365", "AAD", domain, "M365-U01",
-                    "Microsoft 365 tenant exists for domain", Severity.INFO,
-                    f"Domain {domain} is backed by an Entra ID tenant.",
-                    "Informational; ensure tenant hardening applied.",
-                    "unauth", {"openid_config": cfg_url}))
-            # Federation / auth type via GetUserRealm
+                self.add_finding(
+                    provider="m365", service="AAD", resource=domain,
+                    check_id="M365-U01",
+                    title="Microsoft 365 tenant exists for domain",
+                    severity=Severity.INFO,
+                    description=f"Domain {domain} is backed by an Entra ID tenant.",
+                    remediation="Informational; ensure tenant hardening applied.",
+                    mode="unauth", metadata={"openid_config": cfg_url})
             realm_url = (f"https://login.microsoftonline.com/getuserrealm.srf"
                          f"?login=user@{domain}&xml=1")
             try:
                 r2 = requests.get(realm_url, timeout=8)
                 if r2.ok and "Federated" in r2.text:
-                    self.report.add(Finding(
-                        "m365", "AAD", domain, "M365-U02",
-                        "Domain uses federated authentication", Severity.INFO,
-                        "Federated (e.g. ADFS) auth detected; review IdP security.",
-                        "Ensure on-prem federation infra is hardened/patched.",
-                        "unauth"))
+                    self.add_finding(
+                        provider="m365", service="AAD", resource=domain,
+                        check_id="M365-U02",
+                        title="Domain uses federated authentication",
+                        severity=Severity.INFO,
+                        description="Federated (e.g. ADFS) auth detected; review IdP security.",
+                        remediation="Ensure on-prem federation infra is hardened/patched.",
+                        mode="unauth")
             except requests.RequestException:
                 pass
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
-            ex.map(probe, [t.strip() for t in targets if t.strip()])
+            list(ex.map(probe, [t.strip() for t in targets if t.strip()]))
 
 
 # ============================================================================
@@ -643,7 +864,7 @@ class GCPScanner(BaseScanner):
         Requires Application Default Credentials:
             gcloud auth application-default login
         or GOOGLE_APPLICATION_CREDENTIALS pointing to a service-account key.
-        Set GCP_PROJECT_ID env var or pass project.
+        Set GCP_PROJECT_ID env var or rely on ADC default project.
         """
         import os
         try:
@@ -679,19 +900,24 @@ class GCPScanner(BaseScanner):
             for binding in policy.bindings:
                 members = binding.get("members", set())
                 if "allUsers" in members or "allAuthenticatedUsers" in members:
-                    self.report.add(Finding(
-                        "gcp", "GCS", bucket.name, "GCP-GCS-001",
-                        "GCS bucket publicly accessible", Severity.CRITICAL,
-                        f"IAM binding '{binding['role']}' grants public access.",
-                        "Remove allUsers/allAuthenticatedUsers bindings.",
-                        "auth", {"role": binding["role"]}))
+                    self.add_finding(
+                        provider="gcp", service="GCS", resource=bucket.name,
+                        check_id="GCP-GCS-001",
+                        title="GCS bucket publicly accessible",
+                        severity=Severity.CRITICAL,
+                        description=f"IAM binding '{binding['role']}' grants public access.",
+                        remediation="Remove allUsers/allAuthenticatedUsers bindings.",
+                        mode="auth", metadata={"role": binding["role"]})
             ubla = bucket.iam_configuration.uniform_bucket_level_access_enabled
             if not ubla:
-                self.report.add(Finding(
-                    "gcp", "GCS", bucket.name, "GCP-GCS-002",
-                    "Uniform bucket-level access disabled", Severity.MEDIUM,
-                    "Legacy ACLs may grant unintended access.",
-                    "Enable uniform bucket-level access.", "auth"))
+                self.add_finding(
+                    provider="gcp", service="GCS", resource=bucket.name,
+                    check_id="GCP-GCS-002",
+                    title="Uniform bucket-level access disabled",
+                    severity=Severity.MEDIUM,
+                    description="Legacy ACLs may grant unintended access.",
+                    remediation="Enable uniform bucket-level access.",
+                    mode="auth")
 
     def _check_firewall_rules(self):
         compute = self.discovery.build("compute", "v1", credentials=self.creds)
@@ -707,24 +933,28 @@ class GCPScanner(BaseScanner):
                     continue
                 for allowed in fw.get("allowed", []):
                     ports = allowed.get("ports", [])
-                    if not ports:  # all ports
-                        self.report.add(Finding(
-                            "gcp", "VPC", fw["name"], "GCP-FW-001",
-                            "Firewall allows all ports from internet",
-                            Severity.CRITICAL,
-                            f"Rule '{fw['name']}' opens all ports to 0.0.0.0/0.",
-                            "Scope source ranges and ports.", "auth"))
+                    if not ports:
+                        self.add_finding(
+                            provider="gcp", service="VPC", resource=fw["name"],
+                            check_id="GCP-FW-001",
+                            title="Firewall allows all ports from internet",
+                            severity=Severity.CRITICAL,
+                            description=f"Rule '{fw['name']}' opens all ports to 0.0.0.0/0.",
+                            remediation="Scope source ranges and ports.",
+                            mode="auth")
                         continue
                     for pr in ports:
                         for p, svc in risky.items():
                             if self._port_match(pr, p):
-                                self.report.add(Finding(
-                                    "gcp", "VPC", fw["name"], "GCP-FW-002",
-                                    f"Firewall exposes {svc} to internet",
-                                    Severity.CRITICAL,
-                                    f"Rule '{fw['name']}' opens {p} to 0.0.0.0/0.",
-                                    f"Restrict source range for port {p}.",
-                                    "auth"))
+                                self.add_finding(
+                                    provider="gcp", service="VPC",
+                                    resource=fw["name"],
+                                    check_id="GCP-FW-002",
+                                    title=f"Firewall exposes {svc} to internet",
+                                    severity=Severity.CRITICAL,
+                                    description=f"Rule '{fw['name']}' opens {p} to 0.0.0.0/0.",
+                                    remediation=f"Restrict source range for port {p}.",
+                                    mode="auth")
             req = compute.firewalls().list_next(req, resp)
 
     @staticmethod
@@ -743,39 +973,47 @@ class GCPScanner(BaseScanner):
                 name=sa["name"], keyTypes="USER_MANAGED").execute().get(
                 "keys", [])
             for k in keys:
-                self.report.add(Finding(
-                    "gcp", "IAM", sa["email"], "GCP-IAM-001",
-                    "User-managed service account key exists", Severity.MEDIUM,
-                    f"Key {k['name'].split('/')[-1]} is user-managed (rotation risk).",
-                    "Prefer workload identity / short-lived creds; rotate keys.",
-                    "auth"))
+                self.add_finding(
+                    provider="gcp", service="IAM", resource=sa["email"],
+                    check_id="GCP-IAM-001",
+                    title="User-managed service account key exists",
+                    severity=Severity.MEDIUM,
+                    description=(f"Key {k['name'].split('/')[-1]} is "
+                                 "user-managed (rotation risk)."),
+                    remediation="Prefer workload identity / short-lived creds; rotate keys.",
+                    mode="auth")
 
     def scan_unauthenticated(self, targets):
         import requests
         log("[GCP] Probing public GCS buckets...", "info")
 
         def probe(bucket):
-            url = (f"https://storage.googleapis.com/storage/v1/b/{bucket}/o")
+            url = f"https://storage.googleapis.com/storage/v1/b/{bucket}/o"
             try:
                 r = requests.get(url, timeout=8)
             except requests.RequestException:
                 return
             if r.status_code == 200:
-                self.report.add(Finding(
-                    "gcp", "GCS", bucket, "GCP-GCS-U01",
-                    "Public GCS bucket listing exposed", Severity.CRITICAL,
-                    f"Object listing publicly accessible at {url}",
-                    "Remove allUsers IAM bindings.", "unauth", {"url": url}))
+                self.add_finding(
+                    provider="gcp", service="GCS", resource=bucket,
+                    check_id="GCP-GCS-U01",
+                    title="Public GCS bucket listing exposed",
+                    severity=Severity.CRITICAL,
+                    description=f"Object listing publicly accessible at {url}",
+                    remediation="Remove allUsers IAM bindings.",
+                    mode="unauth", metadata={"url": url})
             elif r.status_code in (401, 403):
-                self.report.add(Finding(
-                    "gcp", "GCS", bucket, "GCP-GCS-U02",
-                    "GCS bucket exists (access denied)", Severity.INFO,
-                    "Bucket exists but listing is denied (enumerable).",
-                    "Bucket name discoverable; verify intended access.",
-                    "unauth", {"url": url}))
+                self.add_finding(
+                    provider="gcp", service="GCS", resource=bucket,
+                    check_id="GCP-GCS-U02",
+                    title="GCS bucket exists (access denied)",
+                    severity=Severity.INFO,
+                    description="Bucket exists but listing denied (enumerable).",
+                    remediation="Bucket name discoverable; verify intended access.",
+                    mode="unauth", metadata={"url": url})
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
-            ex.map(probe, [t.strip() for t in targets if t.strip()])
+            list(ex.map(probe, [t.strip() for t in targets if t.strip()]))
 
 
 # ============================================================================
@@ -794,7 +1032,7 @@ def print_report(report: ScanReport):
     if RICH:
         table = Table(title="CloudScan Findings", show_lines=False)
         for col in ("Severity", "Provider", "Service", "Resource",
-                    "Check", "Title", "Mode"):
+                    "Check", "Title", "Mode", "CIS"):
             table.add_column(col, overflow="fold")
         sev_color = {Severity.CRITICAL: "bold red", Severity.HIGH: "red",
                      Severity.MEDIUM: "yellow", Severity.LOW: "cyan",
@@ -802,12 +1040,13 @@ def print_report(report: ScanReport):
         for f in findings:
             table.add_row(
                 f"[{sev_color[f.severity]}]{f.severity.value}[/]",
-                f.provider, f.service, f.resource, f.check_id, f.title, f.mode)
+                f.provider, f.service, f.resource, f.check_id, f.title,
+                f.mode, f.cis)
         console.print(table)
     else:
         for f in findings:
             print(f"[{f.severity.value}] {f.provider}/{f.service} "
-                  f"{f.resource} - {f.title} ({f.check_id})")
+                  f"{f.resource} - {f.title} ({f.check_id}) | {f.cis}")
 
     counts = {}
     for f in findings:
@@ -826,21 +1065,51 @@ SCANNERS = {
 }
 
 
+def build_targets(args, provider):
+    """Assemble the target list for a given provider, honoring
+    --target (inline, repeatable), --targets (file), and --discover (domain).
+    Returns provider-appropriate names (bucket/account names vs domains)."""
+    targets = list(args.target)  # inline first
+    if args.targets:
+        try:
+            with open(args.targets) as fh:
+                targets += [line.strip() for line in fh if line.strip()]
+        except OSError as e:
+            log(f"Could not read targets file: {e}", "err")
+
+    # Auto-discovery from a domain -> provider-specific candidate names
+    if args.discover:
+        disc = Discovery()
+        if provider == "azure":
+            generated = disc.azure_candidate_names(args.discover)
+        elif provider == "m365":
+            generated = disc.domains_for(args.discover)
+        else:  # aws, gcp
+            generated = disc.candidate_names(args.discover)
+        log(f"[{provider}] Discovery generated {len(generated)} "
+            f"candidate(s) from '{args.discover}'.", "info")
+        targets += generated
+
+    # de-duplicate preserving order
+    return list(dict.fromkeys(t for t in targets if t))
+
+
 def main():
     p = argparse.ArgumentParser(
-        description="CloudScan - Multi-Cloud Misconfiguration Scanner")
+        description="CloudScan v2 - Multi-Cloud Misconfiguration Scanner")
     p.add_argument("--provider", required=True,
                    choices=["aws", "azure", "m365", "gcp", "all"])
     p.add_argument("--mode", required=True, choices=["auth", "unauth", "both"])
+    p.add_argument("--target", action="append", default=[],
+                   help="Inline target (repeatable): bucket/account name or "
+                        "domain. e.g. --target mybucket --target example.com")
     p.add_argument("--targets",
-                   help="File with target names/domains (unauth mode)")
+                   help="File with target names/domains (one per line)")
+    p.add_argument("--discover", metavar="DOMAIN",
+                   help="Derive likely resource names from a domain and probe "
+                        "them (unauth mode). e.g. --discover example.com")
     p.add_argument("--output", help="Write JSON report to this file")
     args = p.parse_args()
-
-    targets = []
-    if args.targets:
-        with open(args.targets) as fh:
-            targets = [line.strip() for line in fh if line.strip()]
 
     report = ScanReport(
         started_at=datetime.datetime.utcnow().isoformat() + "Z")
@@ -853,8 +1122,10 @@ def main():
         if args.mode in ("auth", "both"):
             scanner.scan_authenticated()
         if args.mode in ("unauth", "both"):
+            targets = build_targets(args, prov)
             if not targets:
-                log(f"[{prov}] unauth mode needs --targets; skipping.", "warn")
+                log(f"[{prov}] unauth mode needs --target/--targets/--discover; "
+                    "skipping.", "warn")
             else:
                 scanner.scan_unauthenticated(targets)
 
@@ -862,9 +1133,12 @@ def main():
     print_report(report)
 
     if args.output:
-        with open(args.output, "w") as fh:
-            json.dump(report.to_dict(), fh, indent=2)
-        log(f"\nJSON report written to {args.output}", "ok")
+        try:
+            with open(args.output, "w") as fh:
+                json.dump(report.to_dict(), fh, indent=2)
+            log(f"\nJSON report written to {args.output}", "ok")
+        except OSError as e:
+            log(f"Could not write output file: {e}", "err")
 
 
 if __name__ == "__main__":
